@@ -1,50 +1,63 @@
-# Drowse 학습
+# 눈 개폐 분류와 졸음 알람
 
-KD 없이 SmallCNN 또는 DenseNet-121을 CE(label smoothing 0.05)로 단독 학습합니다.
+눈 사진으로 신경망과 PCA 분류기를 만들고, 웹캠에서 양쪽 눈의 개폐 상태를 비교합니다. 모델은 **눈 개폐만 분류**하며, 졸음 여부는 별도의 지속시간 조건으로 판단합니다. 모든 과정의 레이블은 **`0=감음(closed)`, `1=뜸(open)`**입니다.
 
-## 전체 데이터 전처리
+## 파일 구성
 
-```bash
-.venv/bin/python make_subset.py --csv split.csv --out full.csv
+| 파일 | 역할 |
+| --- | --- |
+| `train_preprocess.py` | 경로·입력 규격, 이미지 전처리, 데이터셋, 80:20 분할·캐시, 사진/영상의 눈 ROI 수집 |
+| `train.py` | 신경망 학습, 테스트 정확도 기록·플롯, PCA와 성능 비교, 저장 모델 재평가, 전체 학습 실행 |
+| `train_pca.py` | PCA 계산·저장·평가, 클래스 구분 방향 시각화 |
+| `inf_preprocess.py` | MediaPipe 얼굴 랜드마크, 웹캠 양안 ROI 크롭·전처리 |
+| `inf.py` | 신경망 구조, 저장 신경망·PCA 추론, 전체 웹캠 실행 |
+| `inf_alarm.py` | 졸음 조건·누적 상태·설정 저장, 비차단 경고음 |
+
+신경망 구조는 `inf.py`에 정의해 `train.py`가 함께 사용합니다. 경로와 이미지 전처리는 `train_preprocess.py`에서 공유합니다.
+
+## 학습 파이프라인
+
+```text
+train_preprocess.py → train.py의 신경망 학습 → train_pca.py → 정확도 비교·설정 저장
 ```
 
-기본 `--ratio 1`은 모든 이미지를 사용합니다. 기존 사람 단위 train/val/test 분할을 유지하며,
-학습에는 train만 사용합니다. 현재 전체 84,898장 중 train 63,358장, val 6,621장,
-test 14,919장입니다. `subset.csv`는 예전 축소 데이터이므로 전체 학습에는 `full.csv`를 사용하세요.
-
-전처리 순서는 흑백 → 64×64 리사이즈 → 히스토그램 평활화입니다.
-CPU 1스레드에서 한 장씩 처리하여 `full.npy`에 uint8로 기록합니다(약 348 MB).
-학습과 평가에서는 읽기 전용 mmap으로 필요한 이미지만 읽고,
-CPU에서 증강(학습만)과 [-1, 1] 정규화를 수행한 뒤 배치만 GPU로 전송합니다.
-CSV와 같은 이름의 .npy를 함께 보관하세요. 캐시를 다시 만들 때는 사용 중인 학습을 종료하세요.
-
-## 학습
-
 ```bash
-.venv/bin/python train.py --model small --out ckpt/small_full.pt
-.venv/bin/python train.py --model densenet --freeze head_only --out ckpt/densenet_full.pt
+# 기본: data/our_eyes, SmallCNN, 30 epochs, PCA 최대 64성분
+python train.py
+
+# 다른 입력 또는 학습 설정
+python train.py --folder /data/eyes --epochs 30 --bs 32 --device cpu
+python train.py --csv data/eyes.csv
+python train.py --mrl /data/mrlEyes_2018_01 --split-by subject
+python train.py --model densenet --pretrained
 ```
 
-`--csv` 기본값은 `full.csv`입니다. CUDA에서는 AMP를 기본 사용하며,
-기본 배치는 SmallCNN 32, DenseNet 16입니다. 검증도 같은 배치 크기로 실행합니다.
-마지막 잔여 배치도 학습합니다. DenseNet은 내부에서 224×224로 확대하므로 더 많은 GPU 메모리를 씁니다.
-worker 2개, worker별 CPU 1스레드, prefetch 1로 미리 읽는 양을 제한합니다.
-CPU 부하를 더 줄이려면 `--workers 0`을 사용하세요.
+기본은 클래스 비율을 유지한 이미지 기준 **80:20** 분할입니다. 신경망과 PCA는 한 번 만든 동일 분할을 읽습니다. 같은 사람·영상의 비슷한 사진이 양쪽에 섞이지 않게 하려면 `--split-by subject`를 사용하세요. 이 경우 사람 수를 80:20으로 나누므로 이미지 수의 비율은 달라질 수 있습니다.
 
-메모리가 부족하면 `--bs 16 --accum-steps 2`처럼 실제 배치를 줄이고 gradient를 누적하세요.
-누적 학습은 큰 배치와 BatchNorm 통계가 같지는 않습니다.
-AMP를 끄려면 `--no-amp`, CPU 실행은 `--device cpu`를 사용합니다.
-GPU 메모리는 모델·배치·함께 실행 중인 작업에 따라 달라집니다.
+전처리는 **흑백 → 64×64 → [-1,1] 정규화**입니다. 캐시는 원본 사진으로 다시 만들어 uint8 메모리맵으로 저장하며, 신경망 학습에만 좌우 반전·밝기·회전 등의 증강을 적용합니다. 기존에 히스토그램 평활화를 적용한 캐시와 모델은 새 전처리로 다시 생성해야 합니다.
 
-동일 명령에 `--resume`을 추가하면 `_last.pt`에서 다음 epoch부터 재개합니다.
-모델·CSV·배치·누적 수·epoch 수·freeze·학습률·AMP 설정을 유지해야 합니다.
-기존 KD/구형 체크포인트는 새 학습의 resume 대상으로 사용하지 말고 새 출력 경로를 사용하세요.
-추론용 체크포인트의 state_dict 구조는 유지됩니다.
+신경망은 매 epoch 테스트 정확도를 기록하고 지정한 마지막 epoch의 가중치를 저장합니다. 테스트 정확도로 모델을 선택하거나 조기 종료하지 않습니다.
 
-## 평가
+PCA 자체는 전체 분산이 큰 축을 찾습니다. 그 공간에서 학습 레이블별 평균을 구하고 **뜬 눈 평균 − 감은 눈 평균** 방향으로 다시 투영합니다. 두 평균의 중간이 판정 경계이며, 평균·축·방향·경계는 모두 학습셋에서만 계산합니다. 성분 수는 `--pca-components`로 지정합니다.
 
-```bash
-.venv/bin/python evaluate.py --ckpt ckpt/small_full.pt --out results_full.csv
+## 추론 파이프라인
+
+```text
+inf_preprocess.py의 웹캠 양안 전처리 → inf.py의 신경망/PCA 판정 → inf_alarm.py
 ```
 
-전체 test 분할로 평가하며 학습 중 test를 사용하지 않습니다.
+```bash
+python inf.py                    # 두 방법 비교, 신경망 점수로 알람
+python inf.py --method nn        # 신경망만 실행
+python inf.py --method pca       # PCA만 실행, PCA 점수로 알람
+python inf.py --preview-only     # 모델 없이 웹캠 전처리 확인
+python inf.py --camera 1         # 다른 카메라 사용
+```
+
+얼굴 랜드마크 모델은 필요할 때 자동 다운로드합니다. 각 눈은 `[1,64,64]` 입력으로 분류합니다. PCA의 감음 점수는 학습 경계 기준 점수이며 보정된 확률은 아닙니다. 종료는 `q` 또는 `Esc`, 화면 없는 실행은 `--no-display`를 사용합니다.
+
+기본 졸음 조건은 **양안 감음 점수의 최솟값을 최근 7회 평균한 값이 0.5 이상으로 1.5초 지속**되는 것입니다. 알람 반복 간격은 0.5초입니다. 얼굴·눈 검출 실패나 0.5초를 넘는 관측 공백에는 평균 이력과 누적 시간을 초기화합니다.
+
+설정은 `artifacts/models/alarm_config.json`에서 바꿉니다. 경고음은 Windows의 `winsound`, Linux/macOS의 터미널 벨을 사용하며 터미널 설정에 따라 소리가 나지 않을 수 있습니다.
+
+검증은 합성 이미지의 분할·전처리·학습·PCA·저장 모델 재평가와 모의 카메라 추론·알람 상태를 대상으로 수행합니다. 실제 데이터 정확도와 웹캠·스피커 동작은 사용 환경에서 확인해야 합니다.
