@@ -1,0 +1,172 @@
+"""PCA 계산·저장·평가와 클래스 평균차 방향 시각화. 학습 분할만 계산에 사용한다."""
+import json
+from pathlib import Path
+import tempfile
+
+import numpy as np
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+
+from train_preprocess import EyeDataset, IMG_SIZE, PREPROCESSING, PipelinePaths, gray_vector
+
+MODEL_FORMAT = "eye_pca_centroid_direction_v2"
+LABELS = {"0": "closed", "1": "open"}
+ARRAYS = ("mean", "components", "centroids", "direction", "explained_variance_ratio")
+
+
+class PCAEyeClassifier:
+    def __init__(self, n_components=64, seed=42):
+        if n_components < 1:
+            raise ValueError("PCA 성분 수는 1 이상이어야 합니다")
+        self.n_components, self.seed = n_components, seed
+
+    def fit(self, X, y, preprocessing):
+        from sklearn.decomposition import PCA
+
+        X, y = np.asarray(X, dtype=np.float32), np.asarray(y)
+        if len(X) != len(y) or set(y) != {0, 1}:
+            raise ValueError("학습 데이터에 0=closed, 1=open 레이블이 모두 필요합니다")
+        if not np.ptp(X, axis=0).any():
+            raise ValueError("모든 사진이 같아 PCA 판정 방향을 계산할 수 없습니다")
+        self.preprocessing = dict(preprocessing)
+        self.n_components_ = min(self.n_components, len(X) - 1, X.shape[1])
+        pca = PCA(self.n_components_, svd_solver="randomized", random_state=self.seed).fit(X)
+        self.mean_, self.components_ = pca.mean_, pca.components_
+        self.explained_variance_ratio_ = pca.explained_variance_ratio_
+        projected = self.transform(X)
+        self.centroids_ = np.stack([projected[y == label].mean(0) for label in (0, 1)])
+        difference = self.centroids_[1] - self.centroids_[0]
+        length = np.linalg.norm(difference)
+        if length < 1e-7:
+            raise ValueError("두 클래스 평균이 같아 구분 방향을 계산할 수 없습니다")
+        self.direction_ = difference / length
+        self.threshold_ = float(self.centroids_.mean(0) @ self.direction_)
+        self.score_scale_ = max(float(np.std(projected @ self.direction_)), 1e-7)
+        return self
+
+    def transform(self, X):
+        return (np.atleast_2d(np.asarray(X, dtype=np.float32)) - self.mean_) @ self.components_.T
+
+    def project(self, X):
+        return self.transform(X) @ self.direction_
+
+    def decision_function(self, X):
+        """양수=뜸, 0 이하=감음인 경계까지의 거리."""
+        return self.project(X) - self.threshold_
+
+    def predict(self, X):
+        return (self.decision_function(X) > 0).astype(np.int64)
+
+    def closed_scores(self, X):
+        """학습 분포로 정규화한 감음 점수이며 보정된 확률은 아니다."""
+        margin = self.decision_function(X).astype(np.float64) / self.score_scale_
+        return 1 / (1 + np.exp(np.clip(margin, -60, 60)))
+
+    @property
+    def pixel_direction(self):
+        return self.components_.T @ self.direction_
+
+    def save(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        arrays = {name: getattr(self, name + "_") for name in ARRAYS}
+        np.savez_compressed(path, format=MODEL_FORMAT, labels=json.dumps(LABELS),
+                            preprocessing=json.dumps(self.preprocessing),
+                            requested_components=self.n_components, seed=self.seed,
+                            threshold=self.threshold_, score_scale=self.score_scale_, **arrays)
+        return path
+
+    @classmethod
+    def load(cls, path, expected_preprocessing=None):
+        with np.load(path, allow_pickle=False) as state:
+            if "format" not in state or state["format"].item() != MODEL_FORMAT:
+                raise ValueError("train.py에서 생성한 PCA 모델을 사용하세요")
+            if json.loads(state["labels"].item()) != LABELS:
+                raise ValueError("PCA 레이블은 0=closed, 1=open이어야 합니다")
+            model = cls(int(state["requested_components"]), int(state["seed"]))
+            model.preprocessing = json.loads(state["preprocessing"].item())
+            if expected_preprocessing is not None and model.preprocessing != expected_preprocessing:
+                raise ValueError("PCA 모델과 현재 전처리 규격이 다릅니다")
+            for name in ARRAYS:
+                setattr(model, name + "_", state[name].copy())
+            model.threshold_, model.score_scale_ = float(state["threshold"]), float(state["score_scale"])
+        model.n_components_ = len(model.components_)
+        return model
+
+
+def _matrix(dataset, path):
+    matrix = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32,
+                                      shape=(len(dataset), IMG_SIZE * IMG_SIZE))
+    for index in range(len(dataset)):
+        matrix[index] = gray_vector(dataset.image(index))
+    return matrix
+
+
+def _plots(model, train_X, train_y, test_X, test_y, reports):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for axis, X, y, title in zip(axes, (train_X, test_X), (train_y, test_y), ("Train", "Test")):
+        projection = model.project(X)
+        for label, name in enumerate(("closed", "open")):
+            axis.hist(projection[y == label], bins=25, alpha=0.6, label=name)
+        axis.axvline(model.threshold_, color="black", linestyle="--")
+        axis.set(title=title, xlabel="Class-mean direction", ylabel="Images")
+        axis.legend()
+    figure.tight_layout()
+    figure.savefig(reports / "pca_projection.png", dpi=150)
+    plt.close(figure)
+
+    figure, axis = plt.subplots(figsize=(5, 4))
+    direction = model.pixel_direction.reshape(IMG_SIZE, IMG_SIZE)
+    scale = np.abs(direction).max()
+    image = axis.imshow(direction, cmap="coolwarm", vmin=-scale, vmax=scale)
+    axis.set_title("Pixel direction: closed -> open")
+    axis.axis("off")
+    figure.colorbar(image, ax=axis)
+    figure.tight_layout()
+    figure.savefig(reports / "pca_direction.png", dpi=150)
+    plt.close(figure)
+
+    figure, axes = plt.subplots(2, 4, figsize=(10, 5))
+    for index, axis in enumerate(axes.flat):
+        axis.axis("off")
+        if index < model.n_components_:
+            axis.imshow(model.components_[index].reshape(IMG_SIZE, IMG_SIZE), cmap="coolwarm")
+            axis.set_title(f"PC{index + 1}: {model.explained_variance_ratio_[index]:.1%}")
+    figure.tight_layout()
+    figure.savefig(reports / "pca_components.png", dpi=150)
+    plt.close(figure)
+
+
+def run(csv, output_dir, n_components=64, seed=42):
+    paths = PipelinePaths(output_dir)
+    paths.create()
+    train, test = EyeDataset(csv, "train"), EyeDataset(csv, "test")
+    train_y, test_y = train.df.label.to_numpy(), test.df.label.to_numpy()
+    with tempfile.TemporaryDirectory(prefix="pca-", dir=paths.data) as temporary:
+        train_X = _matrix(train, Path(temporary) / "train.npy")
+        test_X = _matrix(test, Path(temporary) / "test.npy")
+        model = PCAEyeClassifier(n_components, seed).fit(train_X, train_y, PREPROCESSING)
+        predictions = model.predict(test_X)
+        model.save(paths.models / "pca_model.npz")
+        report = {
+            "samples": len(test_y), "train_samples": len(train_y),
+            "accuracy": float(accuracy_score(test_y, predictions)),
+            "macro_f1": float(f1_score(test_y, predictions, average="macro", zero_division=0)),
+            "closed_recall": float(recall_score(test_y, predictions, pos_label=0, zero_division=0)),
+            "closed_precision": float(precision_score(test_y, predictions, pos_label=0, zero_division=0)),
+            "confusion_matrix": confusion_matrix(test_y, predictions, labels=[0, 1]).tolist(),
+            "components": model.n_components_, "threshold": model.threshold_,
+        }
+        result = test.df[["path", "label"]].copy()
+        result["pred"] = predictions
+        result["open_margin"] = model.decision_function(test_X)
+        result["closed_score"] = model.closed_scores(test_X)
+        result.to_csv(paths.reports / "pca_predictions.csv", index=False)
+        _plots(model, train_X, train_y, test_X, test_y, paths.reports)
+        del train_X, test_X
+    (paths.reports / "pca_metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"PCA test accuracy={report['accuracy']:.4f}")
+    return report
