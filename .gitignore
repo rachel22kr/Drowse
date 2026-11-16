@@ -1,0 +1,32 @@
+# Python environments and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local datasets and generated preprocessing caches
+/data/
+/datasets/
+/videos/
+/split*.csv
+/subset*.csv
+/full*.csv
+*.npy
+*.npz
+
+# Training artifacts and evaluation output
+/ckpt/
+/logs/
+/results*.csv
+*.pt
+*.pth
+*.log
+
+# Local credentials and settings
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.DS_Store
