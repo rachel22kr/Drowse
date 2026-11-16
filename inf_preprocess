@@ -1,0 +1,95 @@
+"""웹캠 프레임에서 양쪽 눈을 잘라 학습과 같은 전처리를 적용한다."""
+from dataclasses import dataclass
+from pathlib import Path
+import shutil
+import urllib.request
+
+import cv2
+import numpy as np
+
+from train_preprocess import PipelinePaths, preprocess_gray
+
+EYE_CORNERS = {"left": (263, 362), "right": (33, 133)}
+DEFAULT_LANDMARKER = PipelinePaths().models / "face_landmarker.task"
+LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/latest/face_landmarker.task")
+
+
+def ensure_landmarker(path, allow_download=True):
+    path = Path(path)
+    if path.is_file():
+        return
+    if not allow_download:
+        raise FileNotFoundError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(".part")
+    with urllib.request.urlopen(LANDMARKER_URL, timeout=55) as source, partial.open("wb") as target:
+        shutil.copyfileobj(source, target)
+    partial.replace(path)
+
+
+def create_landmarker(path, confidence=0.5):
+    import mediapipe as mp
+
+    options = mp.tasks.vision.FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(path)),
+        running_mode=mp.tasks.vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=confidence,
+        min_face_presence_confidence=confidence,
+        min_tracking_confidence=confidence,
+    )
+    return mp, mp.tasks.vision.FaceLandmarker.create_from_options(options)
+
+
+def crop_eye_raw(frame, landmarks, eye, crop_scale=1.7, min_eye_width=8):
+    """학습용 사진 수집과 웹캠 전처리가 공유하는 원본 흑백 ROI를 반환한다."""
+    height, width = frame.shape[:2]
+    points = np.array([(landmarks[i].x * width, landmarks[i].y * height)
+                       for i in EYE_CORNERS[eye]])
+    eye_width = np.linalg.norm(points[0] - points[1])
+    if not np.isfinite(points).all() or eye_width < min_eye_width:
+        return None
+    side = int(np.ceil(eye_width * crop_scale))
+    x1, y1 = np.floor(points.mean(axis=0) - side / 2).astype(int)
+    x2, y2 = x1 + side, y1 + side
+    if x1 < 0 or y1 < 0 or x2 > width or y2 > height:
+        return None
+    return cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY), (x1, y1, x2, y2)
+
+
+@dataclass
+class EyeObservation:
+    eyes: list
+    boxes: dict
+    reason: str = "OK"
+
+
+class EyePreprocessor:
+    def __init__(self, landmarker=DEFAULT_LANDMARKER):
+        ensure_landmarker(landmarker)
+        self.mp, self.landmarker = create_landmarker(landmarker)
+        self.timestamp = -1
+
+    def extract(self, frame, timestamp_ms):
+        self.timestamp = max(self.timestamp + 1, int(timestamp_ms))
+        image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB,
+                              data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        result = self.landmarker.detect_for_video(image, self.timestamp)
+        if not result.face_landmarks:
+            return EyeObservation([], {}, "NO FACE")
+        eyes, boxes = [], {}
+        for name in EYE_CORNERS:
+            crop = crop_eye_raw(frame, result.face_landmarks[0], name)
+            if crop is None:
+                return EyeObservation([], {}, "INVALID EYE ROI")
+            raw, boxes[name] = crop
+            eyes.append(preprocess_gray(raw))
+        return EyeObservation(eyes, boxes)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.landmarker.close()
