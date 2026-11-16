@@ -1,0 +1,286 @@
+"""학습 데이터 설정·전처리·80:20 분할과 사진/영상의 눈 ROI 수집."""
+import argparse
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import tempfile
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data" / "our_eyes"
+ARTIFACTS_DIR = BASE_DIR / "artifacts"
+IMG_SIZE = 64
+MEAN = STD = 0.5
+LABEL_NAMES = {0: "closed", 1: "open"}
+PREPROCESSING = dict(version=1, image_size=IMG_SIZE, grayscale=True,
+                     equalize_hist=False, mean=MEAN, std=STD)
+
+
+def project_path(path):
+    path = Path(path).expanduser()
+    return (path if path.is_absolute() else BASE_DIR / path).resolve()
+
+
+@dataclass
+class PipelinePaths:
+    root: Path = ARTIFACTS_DIR
+
+    def __post_init__(self):
+        self.root = project_path(self.root)
+
+    @property
+    def data(self):
+        return self.root / "data"
+
+    @property
+    def models(self):
+        return self.root / "models"
+
+    @property
+    def reports(self):
+        return self.root / "reports"
+
+    def create(self):
+        for directory in (self.data, self.models, self.reports):
+            directory.mkdir(parents=True, exist_ok=True)
+        return self
+
+
+def preprocess_gray(img, size=IMG_SIZE):
+    """원본 ROI를 흑백으로 변환하고 크기를 통일한다."""
+    if img.ndim == 3 and img.shape[2] in (3, 4):
+        code = cv2.COLOR_BGR2GRAY if img.shape[2] == 3 else cv2.COLOR_BGRA2GRAY
+        img = cv2.cvtColor(img, code)
+    return cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+
+
+def load_gray(path, size=IMG_SIZE):
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(path)
+    return preprocess_gray(img, size)
+
+
+def gray_vector(img):
+    """이미 전처리한 한 눈을 PCA/신경망 공통 [-1,1] 벡터로 변환."""
+    return ((img.astype(np.float32) / 255.0 - MEAN) / STD).reshape(-1)
+
+
+def to_tensor(img):
+    return torch.from_numpy(gray_vector(img).reshape(1, IMG_SIZE, IMG_SIZE))
+
+
+def resolve_image_path(value, csv_path):
+    """이미지 상대 경로는 CSV가 있는 폴더 기준."""
+    path = Path(str(value)).expanduser()
+    return (path if path.is_absolute() else Path(csv_path).resolve().parent / path).resolve()
+
+
+class EyeDataset(Dataset):
+    """split CSV 컬럼: path,label(0=감음,1=뜸),subject,split[,glasses,lighting ...]"""
+
+    def __init__(self, csv, split, augment=False):
+        df = pd.read_csv(csv)
+        df["path"] = df["path"].map(lambda p: str(resolve_image_path(p, csv)))
+        self.df = df[df["split"] == split].reset_index(drop=True)
+        self.augment = augment
+        # 프로세스마다 읽기 전용 mmap을 열어 전체 이미지를 RAM에 복제하지 않음.
+        self.cache_path = Path(csv).with_suffix(".npy") if "idx" in df.columns else None
+        self.cache = None
+        if self.cache_path is not None:
+            self._open_cache()
+
+    def _open_cache(self):
+        self.cache = np.load(self.cache_path, mmap_mode="r", allow_pickle=False)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["cache"] = None
+        return state
+
+    def __len__(self):
+        return len(self.df)
+
+    def _aug(self, img):
+        if np.random.rand() < 0.5:
+            img = cv2.flip(img, 1)                       # 좌/우 눈 대칭
+        if np.random.rand() < 0.8:                       # 밝기/대비(조명 변화 모사)
+            a = np.random.uniform(0.6, 1.4)
+            b = np.random.uniform(-40, 40)
+            img = np.clip(a * img.astype(np.float32) + b, 0, 255).astype(np.uint8)
+        if np.random.rand() < 0.3:
+            img = cv2.GaussianBlur(img, (3, 3), 0)
+        if np.random.rand() < 0.5:                       # 작은 회전/이동(크롭 오차 모사)
+            h, w = img.shape
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), np.random.uniform(-15, 15), 1.0)
+            M[:, 2] += np.random.uniform(-0.08, 0.08, 2) * w
+            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+        return img
+
+    def image(self, i):
+        """신경망·PCA·평가에서 같은 전처리 이미지를 읽는다."""
+        row = self.df.iloc[i]
+        if self.cache_path is not None and self.cache is None:
+            self._open_cache()
+        return self.cache[int(row["idx"])].copy() if self.cache is not None else load_gray(row["path"])
+
+    def __getitem__(self, i):
+        img = self.image(i)
+        if self.augment:
+            img = self._aug(img)
+        return to_tensor(img), int(self.df.iloc[i]["label"])
+
+
+def from_folder(root):
+    rows = []
+    for path in sorted(project_path(root).rglob('*')):
+        if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'} and path.parent.name in {'open', 'closed'}:
+            rows.append(dict(path=str(path), label=int(path.parent.name == 'open'), subject=path.parent.parent.name))
+    return pd.DataFrame(rows)
+
+
+def from_mrl(root):
+    rows = []
+    for path in sorted(project_path(root).rglob('*.png')):
+        fields = path.stem.split('_')
+        if len(fields) >= 8:
+            rows.append(dict(path=str(path), subject=fields[0], label=int(fields[4])))
+    return pd.DataFrame(rows)
+
+
+def split_rows(df, seed=42, split_by='sample'):
+    df = df.copy().reset_index(drop=True)
+    if df.empty or not {'path', 'label'} <= set(df.columns):
+        raise ValueError('path,label 열을 가진 CSV 또는 open/closed 사진 폴더가 필요합니다')
+    if df['path'].duplicated().any() or not df['label'].isin([0, 1]).all():
+        raise ValueError('사진 경로는 중복 없이, label은 0=closed 또는 1=open으로 지정하세요')
+    if split_by == 'subject':
+        subjects = sorted(df['subject'].unique())
+        _, test_subjects = train_test_split(subjects, test_size=0.2, random_state=seed)
+        df['split'] = np.where(df['subject'].isin(test_subjects), 'test', 'train')
+    else:
+        _, test_indices = train_test_split(df.index, test_size=0.2, random_state=seed, stratify=df['label'])
+        df['split'] = 'train'
+        df.loc[test_indices, 'split'] = 'test'
+    for split in ('train', 'test'):
+        if set(df.loc[df['split'] == split, 'label']) != {0, 1}:
+            raise ValueError(f'{split}에 감은 눈과 뜬 눈이 모두 필요합니다')
+    return df
+
+
+def write_cache(df, out):
+    """원본 사진으로 캐시를 다시 만들어 현재 전처리 규격을 적용한다."""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out.parent) as temporary:
+        temporary = Path(temporary)
+        cache = np.lib.format.open_memmap(temporary / 'split.npy', mode='w+', dtype=np.uint8,
+                                         shape=(len(df), IMG_SIZE, IMG_SIZE))
+        for index, row in enumerate(df.itertuples(index=False)):
+            cache[index] = load_gray(row.path)
+        cache.flush()
+        del cache
+        result = df.assign(idx=np.arange(len(df)))
+        result.to_csv(temporary / 'split.csv', index=False)
+        os.replace(temporary / 'split.npy', out.with_suffix('.npy'))
+        os.replace(temporary / 'split.csv', out)
+    return out
+
+
+def run(csv=None, output_dir=ARTIFACTS_DIR, *, folder=None, mrl=None, seed=42, split_by='sample'):
+    cv2.setNumThreads(1)
+    paths = PipelinePaths(output_dir).create()
+    if csv is not None:
+        csv = project_path(csv)
+        df = pd.read_csv(csv)
+        df['path'] = df['path'].map(lambda value: str(resolve_image_path(value, csv)))
+    else:
+        df = from_mrl(mrl) if mrl is not None else from_folder(folder or DATA_DIR)
+    df = split_rows(df, seed, split_by)
+    result = write_cache(df, paths.data / 'split.csv')
+    summary = df.groupby(['split', 'label']).size().unstack(fill_value=0)
+    summary.to_csv(paths.reports / 'split_counts.csv')
+    print(f'{summary}\n공통 분할 → {result}')
+    return result
+
+
+def frames(path, every):
+    if path.is_dir():
+        for file in sorted(path.iterdir())[::every]:
+            image = cv2.imread(str(file))
+            if image is not None:
+                yield image
+    elif path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.bmp'}:
+        image = cv2.imread(str(path))
+        if image is None:
+            raise FileNotFoundError(path)
+        yield image
+    else:
+        capture = cv2.VideoCapture(str(path))
+        try:
+            if not capture.isOpened():
+                raise FileNotFoundError(path)
+            index = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if index % every == 0:
+                    yield frame
+                index += 1
+        finally:
+            capture.release()
+
+def collect_eyes(input, subject, label, output_dir=DATA_DIR, artifacts_dir=ARTIFACTS_DIR, every=3):
+    """원본 눈 ROI를 저장한다. 크기 변환은 학습 전처리에서 수행한다."""
+    from inf_preprocess import create_landmarker, crop_eye_raw, ensure_landmarker
+
+    if every < 1:
+        raise ValueError('every는 1 이상이어야 합니다')
+    source = project_path(input)
+    output = project_path(output_dir) / subject / label
+    output.mkdir(parents=True, exist_ok=True)
+    model = PipelinePaths(artifacts_dir).models / 'face_landmarker.task'
+    ensure_landmarker(model)
+    mp, landmarker = create_landmarker(model)
+    saved = 0
+    with landmarker:
+        for index, frame in enumerate(frames(source, every)):
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            result = landmarker.detect_for_video(image, index * 100)
+            if not result.face_landmarks:
+                continue
+            for eye in ('left', 'right'):
+                crop = crop_eye_raw(frame, result.face_landmarks[0], eye)
+                if crop is None:
+                    continue
+                destination = output / f'{source.stem}_{index:05d}_{eye}.png'
+                if destination.exists():
+                    raise FileExistsError(destination)
+                if not cv2.imwrite(str(destination), crop[0]):
+                    raise OSError(f'사진을 저장하지 못했습니다: {destination}')
+                saved += 1
+    print(f'{saved} raw eye images → {output}')
+    return saved
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', type=Path, required=True)
+    parser.add_argument('--subject', required=True)
+    parser.add_argument('--label', choices=['open', 'closed'], required=True)
+    parser.add_argument('--out', type=Path, default=DATA_DIR)
+    parser.add_argument('--artifacts-dir', type=Path, default=ARTIFACTS_DIR)
+    parser.add_argument('--every', type=int, default=3)
+    args = parser.parse_args()
+    collect_eyes(args.input, args.subject, args.label, args.out, args.artifacts_dir, args.every)
+
+
+if __name__ == '__main__':
+    main()
