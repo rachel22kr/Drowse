@@ -1,4 +1,4 @@
-"""웹캠 → 눈 전처리 → 신경망/PCA 추론 → 졸음 조건과 알람. 전체 추론 실행 파일."""
+"""눈 사진·웹캠의 신경망/PCA 추론. 웹캠에서는 4초 이력으로 졸음 조건·알람을 실행한다."""
 import argparse
 import json
 from pathlib import Path
@@ -10,10 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from train_preprocess import (ARTIFACTS_DIR, IMG_SIZE, LABEL_NAMES, MEAN, PREPROCESSING,
-                              STD, PipelinePaths, to_tensor)
+from train_preprocess import (RESULTS_DIR, IMG_SIZE, LABEL_NAMES, MEAN, PREPROCESSING,
+                              STD, PipelinePaths, load_gray, project_path, to_tensor)
 from inf_alarm import AlarmPlayer, DrowsinessConfig, DrowsinessMonitor
-from inf_preprocess import EyePreprocessor
+from inf_preprocess import EyePreprocessor, FrameBuffer
 
 
 def conv_bn(cin, cout, stride=1, groups=1):
@@ -48,16 +48,11 @@ class SmallCNN(nn.Module):
 
 
 class DenseNetClassifier(nn.Module):
-    def __init__(self, pretrained=False, n_cls=2):
+    def __init__(self, n_cls=2):
         super().__init__()
         from torchvision import models
-        weights = models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
-        m = models.densenet121(weights=weights)
-        old = m.features.conv0
-        new = nn.Conv2d(1, 64, 7, 2, 3, bias=False)
-        with torch.no_grad():
-            new.weight.copy_(old.weight.sum(1, keepdim=True))
-        m.features.conv0 = new
+        m = models.densenet121(weights=None)
+        m.features.conv0 = nn.Conv2d(1, 64, 7, 2, 3, bias=False)
         m.classifier = nn.Linear(m.classifier.in_features, n_cls)
         self.m = m
 
@@ -67,11 +62,11 @@ class DenseNetClassifier(nn.Module):
         return self.m(x)
 
 
-def build_model(name, pretrained=False):
+def build_model(name):
     if name == "small":
         return SmallCNN()
     if name == "densenet":
-        return DenseNetClassifier(pretrained)
+        return DenseNetClassifier()
     raise ValueError(name)
 
 
@@ -85,7 +80,7 @@ class NNPredictor:
         labels = {int(key): value for key, value in state.get("label_names", LABEL_NAMES).items()}
         if labels != LABEL_NAMES:
             raise ValueError("모델 레이블은 0=closed, 1=open이어야 합니다")
-        self.model = build_model(state["model"], pretrained=False).to(self.device)
+        self.model = build_model(state["model"]).to(self.device)
         self.model.load_state_dict(state["state_dict"])
         self.model.eval()
 
@@ -125,19 +120,37 @@ class PCAPredictor:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifacts-dir", type=Path, default=ARTIFACTS_DIR)
+    parser.add_argument("--results-dir", "--artifacts-dir", dest="artifacts_dir", type=Path, default=RESULTS_DIR)
     parser.add_argument("--method", choices=["both", "nn", "pca"], default="both")
     parser.add_argument("--alarm-source", choices=["nn", "pca"])
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--image", type=Path, help="웹캠 대신 눈 사진 한 장을 판정")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--preview-only", action="store_true")
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--max-frames", type=int)
     args = parser.parse_args(argv)
+    if args.image is not None and args.preview_only:
+        parser.error("--image와 --preview-only는 함께 사용할 수 없습니다")
     args.alarm_source = args.alarm_source or ("pca" if args.method == "pca" else "nn")
     if not args.preview_only and args.method != "both" and args.alarm_source != args.method:
         parser.error("알람 기준은 실행하는 분류기와 같아야 합니다")
     return args
+
+
+def predict_image(path, predictors, output_dir=RESULTS_DIR):
+    """개별 눈 사진의 개폐만 판정한다. 단일 사진에는 시간 기반 알람을 적용하지 않는다."""
+    path = project_path(path)
+    eyes = [load_gray(path)]
+    results = {}
+    for name, predictor in predictors.items():
+        labels, scores = predictor.predict(eyes)
+        result = dict(label=int(labels[0]), state=LABEL_NAMES[int(labels[0])], closed_score=float(scores[0]))
+        results[name] = result
+        print(f"{name.upper()}: {result['state']} (closed_score={result['closed_score']:.4f})")
+    output = PipelinePaths(output_dir).create().reports / "image_prediction.json"
+    output.write_text(json.dumps(dict(image=str(path), predictions=results), indent=2), encoding="utf-8")
+    return results
 
 
 def draw_preview(frame, observation, lines):
@@ -153,14 +166,25 @@ def run(args):
     paths = PipelinePaths(args.artifacts_dir)
     torch.set_num_threads(1)
     cv2.setNumThreads(1)
-    config = DrowsinessConfig.load(paths.models / "alarm_config.json") if not args.preview_only else DrowsinessConfig()
-    monitor, alarm = DrowsinessMonitor(config), AlarmPlayer()
     predictors = {}
     if not args.preview_only:
+        required = {"nn": "best_model.pt", "pca": "pca_model.npz"}
+        missing = [paths.models / filename for name, filename in required.items()
+                   if args.method in ("both", name) and not (paths.models / filename).is_file()]
+        if missing:
+            raise FileNotFoundError(f"모델이 없습니다: {missing[0]}. python train.py --results-dir {paths.root}로 먼저 학습하세요")
         if args.method in ("both", "nn"):
-            predictors["nn"] = NNPredictor(paths.models / "eye_model.pt", args.device)
+            predictors["nn"] = NNPredictor(paths.models / "best_model.pt", args.device)
         if args.method in ("both", "pca"):
             predictors["pca"] = PCAPredictor(paths.models / "pca_model.npz")
+    if args.image is not None:
+        return predict_image(args.image, predictors, paths.root)
+    config_path = paths.models / "alarm_config.json"
+    config = DrowsinessConfig.load(config_path) if config_path.is_file() else DrowsinessConfig()
+    if not args.preview_only:
+        config.save(config_path)
+    monitor, alarm = DrowsinessMonitor(config), AlarmPlayer()
+    recent_frames = FrameBuffer(config.buffer_sec)
     with EyePreprocessor(paths.models / "face_landmarker.task") as preprocessor:
         camera = cv2.VideoCapture(args.camera)
         try:
@@ -173,6 +197,7 @@ def run(args):
                 observed_at = time.monotonic()
                 if not ok:
                     monitor.update(None, observed_at)
+                    recent_frames.prune(observed_at)
                     break
                 observation = preprocessor.extract(frame, (observed_at - origin) * 1000)
                 lines, scores = [], {}
@@ -186,9 +211,14 @@ def run(args):
                 now = time.monotonic()
                 current = scores.get(args.alarm_source) if now - observed_at <= config.max_gap else None
                 result = monitor.update(current, observed_at)
+                recent_frames.append(observed_at, frame, result, scores)
+                recent_frames.prune(now)
                 if result.triggered:
                     alarm.trigger()
-                lines.append(f"{result.status}: {result.elapsed:.1f}s / {config.closed_sec:g}s")
+                period = f"{result.period:.2f}s" if result.period is not None else "waiting"
+                lines.append(f"{result.status}: closed {result.elapsed:.2f}s / {config.closed_sec:g}s")
+                lines.append(f"period {period} / <= {config.closure_period_sec:g}s | "
+                             f"buffer {config.buffer_sec:g}s: {len(recent_frames)} frames")
                 if now - last_log >= 1:
                     print(" | ".join(lines), flush=True)
                     last_log = now
@@ -201,6 +231,7 @@ def run(args):
                     break
         finally:
             camera.release()
+            recent_frames.clear()
             alarm.close()
             if not args.no_display:
                 cv2.destroyAllWindows()
