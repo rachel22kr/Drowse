@@ -4,7 +4,8 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.metrics import (accuracy_score, average_precision_score, confusion_matrix,
+                             f1_score, precision_score, recall_score, roc_auc_score)
 
 from train_preprocess import EyeDataset, IMG_SIZE, PREPROCESSING, PipelinePaths, gray_vector
 
@@ -150,6 +151,9 @@ def run(csv, output_dir, n_components=64, seed=42):
         test_X = _matrix(test, Path(temporary) / "test.npy")
         model = PCAEyeClassifier(n_components, seed).fit(train_X, train_y, PREPROCESSING)
         predictions = model.predict(test_X)
+        closed_scores = model.closed_scores(test_X)
+        closed_targets = test_y == 0
+        both_classes = np.unique(closed_targets).size == 2
         model.save(paths.models / "pca_model.npz")
         report = {
             "samples": len(test_y), "train_samples": len(train_y),
@@ -157,13 +161,15 @@ def run(csv, output_dir, n_components=64, seed=42):
             "macro_f1": float(f1_score(test_y, predictions, average="macro", zero_division=0)),
             "closed_recall": float(recall_score(test_y, predictions, pos_label=0, zero_division=0)),
             "closed_precision": float(precision_score(test_y, predictions, pos_label=0, zero_division=0)),
+            "roc_auc": float(roc_auc_score(closed_targets, closed_scores)) if both_classes else None,
+            "average_precision": float(average_precision_score(closed_targets, closed_scores)) if both_classes else None,
             "confusion_matrix": confusion_matrix(test_y, predictions, labels=[0, 1]).tolist(),
             "components": model.n_components_, "threshold": model.threshold_,
         }
         result = test.df[["path", "label"]].copy()
         result["pred"] = predictions
         result["open_margin"] = model.decision_function(test_X)
-        result["closed_score"] = model.closed_scores(test_X)
+        result["closed_score"] = closed_scores
         result.to_csv(paths.reports / "pca_predictions.csv", index=False)
         _plots(model, train_X, train_y, test_X, test_y, paths.reports)
         del train_X, test_X
