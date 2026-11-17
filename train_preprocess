@@ -13,8 +13,10 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data" / "our_eyes"
-ARTIFACTS_DIR = BASE_DIR / "artifacts"
+DATA_DIR = BASE_DIR / "datasets"
+RESULTS_DIR = BASE_DIR / "results"
+COLLECT_DIR = RESULTS_DIR / "collected_eyes"
+ARTIFACTS_DIR = RESULTS_DIR
 IMG_SIZE = 64
 MEAN = STD = 0.5
 LABEL_NAMES = {0: "closed", 1: "open"}
@@ -29,26 +31,25 @@ def project_path(path):
 
 @dataclass
 class PipelinePaths:
-    root: Path = ARTIFACTS_DIR
+    root: Path = RESULTS_DIR
 
     def __post_init__(self):
         self.root = project_path(self.root)
 
     @property
     def data(self):
-        return self.root / "data"
+        return self.root
 
     @property
     def models(self):
-        return self.root / "models"
+        return self.root
 
     @property
     def reports(self):
-        return self.root / "reports"
+        return self.root
 
     def create(self):
-        for directory in (self.data, self.models, self.reports):
-            directory.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
         return self
 
 
@@ -201,12 +202,14 @@ def run(csv=None, output_dir=ARTIFACTS_DIR, *, folder=None, mrl=None, seed=42, s
         df = pd.read_csv(csv)
         df['path'] = df['path'].map(lambda value: str(resolve_image_path(value, csv)))
     else:
-        df = from_mrl(mrl) if mrl is not None else from_folder(folder or DATA_DIR)
+        root = project_path(mrl or folder or DATA_DIR)
+        df = from_mrl(root) if mrl is not None or (root / 'annotation.txt').is_file() else from_folder(root)
+        print(f"데이터셋: {root} ({len(df):,}장)", flush=True)
     df = split_rows(df, seed, split_by)
     result = write_cache(df, paths.data / 'split.csv')
     summary = df.groupby(['split', 'label']).size().unstack(fill_value=0)
     summary.to_csv(paths.reports / 'split_counts.csv')
-    print(f'{summary}\n공통 분할 → {result}')
+    print(f'{summary}\n공통 분할 → {result}', flush=True)
     return result
 
 
@@ -237,14 +240,14 @@ def frames(path, every):
         finally:
             capture.release()
 
-def collect_eyes(input, subject, label, output_dir=DATA_DIR, artifacts_dir=ARTIFACTS_DIR, every=3):
+def collect_eyes(input, subject, label, output_dir=None, artifacts_dir=ARTIFACTS_DIR, every=3):
     """원본 눈 ROI를 저장한다. 크기 변환은 학습 전처리에서 수행한다."""
     from inf_preprocess import create_landmarker, crop_eye_raw, ensure_landmarker
 
     if every < 1:
         raise ValueError('every는 1 이상이어야 합니다')
     source = project_path(input)
-    output = project_path(output_dir) / subject / label
+    output = (project_path(output_dir) if output_dir is not None else PipelinePaths(artifacts_dir).root / 'collected_eyes') / subject / label
     output.mkdir(parents=True, exist_ok=True)
     model = PipelinePaths(artifacts_dir).models / 'face_landmarker.task'
     ensure_landmarker(model)
@@ -275,8 +278,8 @@ def main():
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--subject', required=True)
     parser.add_argument('--label', choices=['open', 'closed'], required=True)
-    parser.add_argument('--out', type=Path, default=DATA_DIR)
-    parser.add_argument('--artifacts-dir', type=Path, default=ARTIFACTS_DIR)
+    parser.add_argument('--out', type=Path)
+    parser.add_argument('--results-dir', '--artifacts-dir', dest='artifacts_dir', type=Path, default=RESULTS_DIR)
     parser.add_argument('--every', type=int, default=3)
     args = parser.parse_args()
     collect_eyes(args.input, args.subject, args.label, args.out, args.artifacts_dir, args.every)
