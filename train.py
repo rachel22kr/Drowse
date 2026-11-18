@@ -57,11 +57,19 @@ def summarize(labels, predictions, closed_scores=None):
     return report
 
 
+def set_accuracy_limits(axis, values):
+    values = np.asarray(values, dtype=float)
+    lower, upper = values.min(), values.max()
+    padding = max((upper - lower) * 0.08, 0.001)
+    axis.set_ylim(max(0, lower - padding), min(1, upper + padding))
+
+
 def plot_accuracy(history, path, best_epoch):
     figure, axis = plt.subplots(figsize=(6, 4))
-    axis.plot(history["epoch"], history["test_accuracy"], marker="o", label="Test accuracy (monitor only)")
+    axis.plot(history["epoch"], history["test_accuracy"], linestyle="-", label="Test accuracy (monitor only)")
     axis.axvline(best_epoch, color="tab:red", linestyle="--", label="Best validation epoch")
-    axis.set(xlabel="Epoch", ylabel="Test accuracy", ylim=(0, 1.02))
+    axis.set(xlabel="Epoch", ylabel="Test accuracy")
+    set_accuracy_limits(axis, history["test_accuracy"])
     axis.grid(alpha=0.25)
     axis.legend()
     figure.tight_layout()
@@ -79,7 +87,7 @@ def plot_accuracy(history, path, best_epoch):
         axis.set(xlabel="Epoch", ylabel=ylabel)
         axis.grid(alpha=0.25)
         axis.legend()
-    axes[1].set_ylim(0, 1.02)
+    set_accuracy_limits(axes[1], history[["train_accuracy_augmented", "val_accuracy", "test_accuracy"]])
     figure.tight_layout()
     figure.savefig(path.parent / "training_curves.png", dpi=160)
     plt.close(figure)
@@ -306,7 +314,7 @@ def main(argv=None):
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--min-delta', type=float, default=1e-4)
     parser.add_argument('--val-ratio', type=float, default=0.1)
     parser.add_argument('--pca-components', type=int, default=64)
